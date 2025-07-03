@@ -6,11 +6,12 @@
 
 import streamlit as st
 import pandas as pd
-import pyodbc
 import os
 import json
 import io
+import zipfile
 from datetime import datetime
+import pyodbc
 
 CONFIG_FILE = "config.json"
 
@@ -34,10 +35,21 @@ def generate_keys(df):
     df['key4'] = df['Invoice Date'].astype(str) + '_' + df['Gross Amount'].astype(str) + '_' + df['Supplier Number'].astype(str) + '_' + df['Invoice Number'].astype(str)
     return df
 
-def connect_access_db(path):
-    return pyodbc.connect(rf'DRIVER={{Microsoft Access Driver (*.mdb, *.accdb)}};DBQ={path};')
+def convert_access_to_csv(path):
+    conn = pyodbc.connect(rf'DRIVER={{Microsoft Access Driver (*.mdb, *.accdb)}};DBQ={path};')
+    cursor = conn.cursor()
+    tables = [t.table_name for t in cursor.tables(tableType='TABLE') if not t.table_name.startswith("MSys")]
+    export_path = os.path.join(os.getcwd(), "access_export")
+    os.makedirs(export_path, exist_ok=True)
+    table_csvs = {}
+    for table in tables:
+        df = pd.read_sql(f"SELECT * FROM [{table}]", conn)
+        df.to_csv(os.path.join(export_path, f"{table}.csv"), index=False)
+        table_csvs[table] = df
+    conn.close()
+    return tables, table_csvs
 
-def check_match(row):
+def check_match(row, master_df):
     if row['key4'] in master_df['key4'].values:
         return pd.Series(['Yes', 'Date+Amount+Supplier+Number'])
     elif row['key1'] in master_df['key1'].values:
@@ -49,11 +61,10 @@ def check_match(row):
     else:
         return pd.Series(['No', 'UNIQUE'])
 
-# Streamlit UI setup
+# UI Setup
 st.set_page_config(page_title="Invoice Duplicate Checker", layout="centered")
 st.title("Invoice Duplicate Checker")
 
-# Load previous DB
 last_db_path = load_config()
 use_existing = False
 
@@ -61,10 +72,11 @@ if last_db_path and os.path.exists(last_db_path):
     st.info(f"Last used database: `{last_db_path}`\nLast updated: {get_db_modified_time(last_db_path)}")
     use_existing = st.radio("Choose database:", ["Use last", "Select new"]) == "Use last"
 
+# Upload Access DB
 if use_existing:
     db_path = last_db_path
 else:
-    db_file = st.file_uploader("Upload MS Access DB (.accdb)", type=["accdb"])
+    db_file = st.file_uploader("Upload Access DB (.accdb)", type=["accdb"])
     if db_file:
         db_path = os.path.join(os.getcwd(), "current_db.accdb")
         with open(db_path, "wb") as f:
@@ -73,26 +85,23 @@ else:
     else:
         st.stop()
 
-# Upload Excel file
+# Convert Access to CSV and Load First Table
+try:
+    tables, table_data = convert_access_to_csv(db_path)
+    selected_table = tables[0]
+    master_df = table_data[selected_table][['Invoice Number', 'Invoice Date', 'Gross Amount', 'Supplier Number']].copy()
+    master_df['Invoice Date'] = pd.to_datetime(master_df['Invoice Date'], errors='coerce')
+    master_df = generate_keys(master_df)
+except Exception as e:
+    st.error(f"Conversion error: {e}")
+    st.stop()
+
+# Upload Excel File
 excel_file = st.file_uploader("Upload Invoice Excel File", type=["xlsx", "xls"])
 if not excel_file:
     st.stop()
 
-# Load Access DB
-try:
-    conn = connect_access_db(db_path)
-    cursor = conn.cursor()
-    tables = [t.table_name for t in cursor.tables(tableType='TABLE') if not t.table_name.startswith("MSys")]
-    table = tables[0]
-    query = f"SELECT [Invoice Number], [Invoice Date], [Gross Amount], [Supplier Number] FROM [{table}]"
-    master_df = pd.read_sql(query, conn)
-    master_df['Invoice Date'] = pd.to_datetime(master_df['Invoice Date'], errors='coerce')
-    master_df = generate_keys(master_df)
-except Exception as e:
-    st.error(f"Access DB error: {e}")
-    st.stop()
-
-# Load Excel input
+# Load Excel and Match
 try:
     raw_df = pd.read_excel(excel_file)
     raw_df.columns = raw_df.columns.str.strip()
@@ -100,47 +109,31 @@ try:
     df['Invoice Date'] = pd.to_datetime(df['Invoice Date'], errors='coerce')
     df = df.dropna(subset=['Invoice Date'])
     df = generate_keys(df)
+    df[['Duplicate', 'Match Logic']] = df.apply(lambda row: check_match(row, master_df), axis=1)
 except Exception as e:
     st.error(f"Excel load error: {e}")
     st.stop()
 
-# Matching Logic
-df[['Duplicate', 'Match Logic']] = df.apply(check_match, axis=1)
+# Show Results
 st.success("Duplicate check completed.")
 st.dataframe(df)
 
-# Export to Excel with original columns preserved
+# Download Results
 excel_buffer = io.BytesIO()
 final_df = raw_df.copy()
 final_df['Duplicate'] = df['Duplicate']
 final_df['Match Logic'] = df['Match Logic']
 final_df.to_excel(excel_buffer, index=False)
+st.download_button("📥 Download Results as Excel", data=excel_buffer.getvalue(), file_name="duplicates_report.xlsx")
 
-st.download_button(
-    "📥 Download Results as Excel",
-    data=excel_buffer.getvalue(),
-    file_name="duplicates_report.xlsx"
-)
-
-# Merge non-duplicates
+# Merge non-duplicates into CSV (optional: show how to merge logic)
 if "No" in df['Duplicate'].values:
-    if st.button("🧩 Merge UNIQUE Records into Access DB"):
+    if st.button("🧩 Show UNIQUE Records"):
         unique_df = df[df['Duplicate'] == "No"][['Invoice Number', 'Invoice Date', 'Gross Amount', 'Supplier Number']]
-        try:
-            for _, row in unique_df.iterrows():
-                cursor.execute(
-                    f"""INSERT INTO [{table}] ([Invoice Number], [Invoice Date], [Gross Amount], [Supplier Number])
-                        VALUES (?, ?, ?, ?)""",
-                    row['Invoice Number'], row['Invoice Date'], row['Gross Amount'], row['Supplier Number']
-                )
-            conn.commit()
-            st.success("Unique rows merged into Access database.")
-        except Exception as e:
-            st.error(f"Merge error: {e}")
+        st.write("These rows are not found in the Access database:")
+        st.dataframe(unique_df)
 else:
-    st.warning("No unique records to merge.")
-
-conn.close()
+    st.warning("No unique records found.")
 
 
 
